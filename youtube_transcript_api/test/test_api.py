@@ -1,356 +1,531 @@
-from unittest import TestCase
-from mock import patch
-
+import pytest
 import os
+from pathlib import Path
+from unittest import TestCase
+from unittest.mock import patch
+from urllib.parse import urlparse, parse_qs
 
 import requests
-
-import httpretty
+import responses
 
 from youtube_transcript_api import (
     YouTubeTranscriptApi,
     TranscriptsDisabled,
     NoTranscriptFound,
     VideoUnavailable,
-    TooManyRequests,
-    NoTranscriptAvailable,
+    IpBlocked,
     NotTranslatable,
     TranslationLanguageNotAvailable,
     CookiePathInvalid,
-    CookiesInvalid,
+    CookieInvalid,
     FailedToCreateConsentCookie,
     YouTubeRequestFailed,
     InvalidVideoId,
+    FetchedTranscript,
+    FetchedTranscriptSnippet,
+    AgeRestricted,
+    RequestBlocked,
+    VideoUnplayable,
+    PoTokenRequired,
 )
+from youtube_transcript_api.proxies import GenericProxyConfig, WebshareProxyConfig
 
 
-def load_asset(filename):
-    filepath = '{dirname}/assets/{filename}'.format(
-        dirname=os.path.dirname(__file__), filename=filename)
+def get_asset_path(filename: str) -> Path:
+    return Path(
+        "{dirname}/assets/{filename}".format(
+            dirname=os.path.dirname(__file__), filename=filename
+        )
+    )
 
-    with open(filepath, mode="rb") as file:
+
+def load_asset(filename: str):
+    with open(get_asset_path(filename), mode="rb") as file:
         return file.read()
 
 
 class TestYouTubeTranscriptApi(TestCase):
     def setUp(self):
-        httpretty.enable()
-        httpretty.register_uri(
-            httpretty.GET,
-            'https://www.youtube.com/watch',
-            body=load_asset('youtube.html.static')
+        responses.start()
+        self.addCleanup(responses.stop)
+        self.addCleanup(responses.reset)
+
+        self.ref_transcript = FetchedTranscript(
+            snippets=[
+                FetchedTranscriptSnippet(
+                    text="Hey, this is just a test",
+                    start=0.0,
+                    duration=1.54,
+                ),
+                FetchedTranscriptSnippet(
+                    text="this is not the original transcript",
+                    start=1.54,
+                    duration=4.16,
+                ),
+                FetchedTranscriptSnippet(
+                    text="just something shorter, I made up for testing",
+                    start=5.7,
+                    duration=3.239,
+                ),
+            ],
+            language="English",
+            language_code="en",
+            is_generated=False,
+            video_id="GJLlxj_dtq8",
         )
-        httpretty.register_uri(
-            httpretty.GET,
-            'https://www.youtube.com/api/timedtext',
-            body=load_asset('transcript.xml.static')
+        self.ref_transcript_raw = self.ref_transcript.to_raw_data()
+
+        responses.post(
+            "https://www.youtube.com/youtubei/v1/player",
+            body=load_asset("youtube.innertube.json.static"),
+            content_type="application/json",
+        )
+        responses.get(
+            "https://www.youtube.com/watch",
+            body=load_asset("youtube.html.static"),
+        )
+        responses.get(
+            "https://www.youtube.com/api/timedtext",
+            body=load_asset("transcript.xml.static"),
         )
 
-    def tearDown(self):
-        httpretty.reset()
-        httpretty.disable()
-
-    def test_get_transcript(self):
-        transcript = YouTubeTranscriptApi.get_transcript('GJLlxj_dtq8')
+    def test_fetch(self):
+        transcript = YouTubeTranscriptApi().fetch("GJLlxj_dtq8")
 
         self.assertEqual(
             transcript,
-            [
-                {'text': 'Hey, this is just a test', 'start': 0.0, 'duration': 1.54},
-                {'text': 'this is not the original transcript', 'start': 1.54, 'duration': 4.16},
-                {'text': 'just something shorter, I made up for testing', 'start': 5.7, 'duration': 3.239}
-            ]
+            self.ref_transcript,
         )
 
-    def test_get_transcript_formatted(self):
-        transcript = YouTubeTranscriptApi.get_transcript('GJLlxj_dtq8', preserve_formatting=True)
+    def test_fetch_formatted(self):
+        transcript = YouTubeTranscriptApi().fetch(
+            "GJLlxj_dtq8", preserve_formatting=True
+        )
+
+        self.ref_transcript[1].text = "this is <i>not</i> the original transcript"
 
         self.assertEqual(
             transcript,
-            [
-                {'text': 'Hey, this is just a test', 'start': 0.0, 'duration': 1.54},
-                {'text': 'this is <i>not</i> the original transcript', 'start': 1.54, 'duration': 4.16},
-                {'text': 'just something shorter, I made up for testing', 'start': 5.7, 'duration': 3.239}
-            ]
+            self.ref_transcript,
         )
 
-    def test_list_transcripts(self):
-        transcript_list = YouTubeTranscriptApi.list_transcripts('GJLlxj_dtq8')
+    def test_fetch__with_altered_user_agent(self):
+        responses.replace(
+            responses.POST,
+            "https://www.youtube.com/youtubei/v1/player",
+            body=load_asset("youtube_altered_user_agent.innertube.json.static"),
+        )
+
+        transcript = YouTubeTranscriptApi().fetch("GJLlxj_dtq8")
+
+        self.assertEqual(
+            transcript,
+            self.ref_transcript,
+        )
+
+    def test_list(self):
+        transcript_list = YouTubeTranscriptApi().list("GJLlxj_dtq8")
 
         language_codes = {transcript.language_code for transcript in transcript_list}
 
-        self.assertEqual(language_codes, {'zh', 'de', 'en', 'hi', 'ja', 'ko', 'es', 'cs', 'en'})
+        self.assertEqual(
+            language_codes, {"zh", "de", "en", "hi", "ja", "ko", "es", "cs", "en"}
+        )
 
-    def test_list_transcripts__find_manually_created(self):
-        transcript_list = YouTubeTranscriptApi.list_transcripts('GJLlxj_dtq8')
-        transcript = transcript_list.find_manually_created_transcript(['cs'])
+    def test_list__find_manually_created(self):
+        transcript_list = YouTubeTranscriptApi().list("GJLlxj_dtq8")
+        transcript = transcript_list.find_manually_created_transcript(["cs"])
 
         self.assertFalse(transcript.is_generated)
 
-
-    def test_list_transcripts__find_generated(self):
-        transcript_list = YouTubeTranscriptApi.list_transcripts('GJLlxj_dtq8')
+    def test_list__find_generated(self):
+        transcript_list = YouTubeTranscriptApi().list("GJLlxj_dtq8")
 
         with self.assertRaises(NoTranscriptFound):
-            transcript_list.find_generated_transcript(['cs'])
+            transcript_list.find_generated_transcript(["cs"])
 
-        transcript = transcript_list.find_generated_transcript(['en'])
+        transcript = transcript_list.find_generated_transcript(["en"])
 
         self.assertTrue(transcript.is_generated)
 
-    def test_list_transcripts__url_as_video_id(self):
-        httpretty.register_uri(
-            httpretty.GET,
-            'https://www.youtube.com/watch',
-            body=load_asset('youtube_transcripts_disabled.html.static')
+    def test_list__url_as_video_id(self):
+        responses.replace(
+            responses.POST,
+            "https://www.youtube.com/youtubei/v1/player",
+            body=load_asset("youtube_video_unavailable.innertube.json.static"),
         )
 
         with self.assertRaises(InvalidVideoId):
-            YouTubeTranscriptApi.list_transcripts('https://www.youtube.com/watch?v=GJLlxj_dtq8')
-
-
-    def test_list_transcripts__no_translation_languages_provided(self):
-        httpretty.register_uri(
-            httpretty.GET,
-            'https://www.youtube.com/watch',
-            body=load_asset('youtube_no_translation_languages.html.static')
-        )
-
-        transcript_list = YouTubeTranscriptApi.list_transcripts('GJLlxj_dtq8')
-        for transcript in transcript_list:
-            self.assertEqual(len(transcript.translation_languages), 0)
-
+            YouTubeTranscriptApi().list(
+                "https://www.youtube.com/youtubei/v1/player?v=GJLlxj_dtq8"
+            )
 
     def test_translate_transcript(self):
-        transcript = YouTubeTranscriptApi.list_transcripts('GJLlxj_dtq8').find_transcript(['en'])
+        transcript = YouTubeTranscriptApi().list("GJLlxj_dtq8").find_transcript(["en"])
 
-        translated_transcript = transcript.translate('af')
+        translated_transcript = transcript.translate("ar")
 
-        self.assertEqual(translated_transcript.language_code, 'af')
-        self.assertIn('&tlang=af', translated_transcript._url)
+        self.assertEqual(translated_transcript.language_code, "ar")
+        self.assertIn("&tlang=ar", translated_transcript._url)
 
     def test_translate_transcript__translation_language_not_available(self):
-        transcript = YouTubeTranscriptApi.list_transcripts('GJLlxj_dtq8').find_transcript(['en'])
+        transcript = YouTubeTranscriptApi().list("GJLlxj_dtq8").find_transcript(["en"])
 
         with self.assertRaises(TranslationLanguageNotAvailable):
-            transcript.translate('xyz')
+            transcript.translate("xyz")
 
     def test_translate_transcript__not_translatable(self):
-        transcript = YouTubeTranscriptApi.list_transcripts('GJLlxj_dtq8').find_transcript(['en'])
+        transcript = YouTubeTranscriptApi().list("GJLlxj_dtq8").find_transcript(["en"])
         transcript.translation_languages = []
 
         with self.assertRaises(NotTranslatable):
-            transcript.translate('af')
+            transcript.translate("af")
 
-    def test_get_transcript__correct_language_is_used(self):
-        YouTubeTranscriptApi.get_transcript('GJLlxj_dtq8', ['de', 'en'])
-        query_string = httpretty.last_request().querystring
+    def test_fetch__correct_language_is_used(self):
+        YouTubeTranscriptApi().fetch("GJLlxj_dtq8", ["de", "en"])
+        parsed_url = urlparse(responses.calls[-1].request.url)
+        query_string = parse_qs(parsed_url.query)
 
-        self.assertIn('lang', query_string)
-        self.assertEqual(len(query_string['lang']), 1)
-        self.assertEqual(query_string['lang'][0], 'de')
+        self.assertIn("lang", query_string)
+        self.assertEqual(len(query_string["lang"]), 1)
+        self.assertEqual(query_string["lang"][0], "de")
 
-    def test_get_transcript__fallback_language_is_used(self):
-        httpretty.register_uri(
-            httpretty.GET,
-            'https://www.youtube.com/watch',
-            body=load_asset('youtube_ww1_nl_en.html.static')
+    def test_fetch__fallback_language_is_used(self):
+        responses.replace(
+            responses.POST,
+            "https://www.youtube.com/youtubei/v1/player",
+            body=load_asset("youtube_ww1_nl_en.innertube.json.static"),
         )
 
-        YouTubeTranscriptApi.get_transcript('F1xioXWb8CY', ['de', 'en'])
-        query_string = httpretty.last_request().querystring
+        YouTubeTranscriptApi().fetch("F1xioXWb8CY", ["de", "en"])
+        parsed_url = urlparse(responses.calls[-1].request.url)
+        query_string = parse_qs(parsed_url.query)
 
-        self.assertIn('lang', query_string)
-        self.assertEqual(len(query_string['lang']), 1)
-        self.assertEqual(query_string['lang'][0], 'en')
+        self.assertIn("lang", query_string)
+        self.assertEqual(len(query_string["lang"]), 1)
+        self.assertEqual(query_string["lang"][0], "en")
 
-    def test_get_transcript__create_consent_cookie_if_needed(self):
-        httpretty.register_uri(
-            httpretty.GET,
-            'https://www.youtube.com/watch',
-            body=load_asset('youtube_consent_page.html.static')
+    def test_fetch__create_consent_cookie_if_needed(self):
+        responses.replace(
+            responses.GET,
+            "https://www.youtube.com/watch",
+            body=load_asset("youtube_consent_page.html.static"),
+        )
+        responses.add(
+            responses.GET,
+            "https://www.youtube.com/watch",
+            body=load_asset("youtube.html.static"),
         )
 
-        YouTubeTranscriptApi.get_transcript('F1xioXWb8CY')
-        self.assertEqual(len(httpretty.latest_requests()), 3)
-        for request in httpretty.latest_requests()[1:]:
-            self.assertEqual(request.headers['cookie'], 'CONSENT=YES+cb.20210328-17-p0.de+FX+119')
+        YouTubeTranscriptApi().fetch("F1xioXWb8CY")
+        self.assertEqual(len(responses.calls), 4)
 
-    def test_get_transcript__exception_if_create_consent_cookie_failed(self):
-        httpretty.register_uri(
-            httpretty.GET,
-            'https://www.youtube.com/watch',
-            body=load_asset('youtube_consent_page.html.static')
+        for call in responses.calls[1:]:
+            self.assertEqual(
+                call.request.headers["cookie"],
+                "CONSENT=YES+cb.20210328-17-p0.de+FX+119",
+            )
+
+    def test_fetch__exception_if_create_consent_cookie_failed(self):
+        responses.replace(
+            responses.GET,
+            "https://www.youtube.com/watch",
+            body=load_asset("youtube_consent_page.html.static"),
         )
-        httpretty.register_uri(
-            httpretty.GET,
-            'https://www.youtube.com/watch',
-            body=load_asset('youtube_consent_page.html.static')
+        responses.add(
+            responses.GET,
+            "https://www.youtube.com/watch",
+            body=load_asset("youtube_consent_page.html.static"),
         )
 
         with self.assertRaises(FailedToCreateConsentCookie):
-            YouTubeTranscriptApi.get_transcript('F1xioXWb8CY')
+            YouTubeTranscriptApi().fetch("F1xioXWb8CY")
 
-    def test_get_transcript__exception_if_consent_cookie_age_invalid(self):
-        httpretty.register_uri(
-            httpretty.GET,
-            'https://www.youtube.com/watch',
-            body=load_asset('youtube_consent_page_invalid.html.static')
+    def test_fetch__exception_if_consent_cookie_age_invalid(self):
+        responses.replace(
+            responses.GET,
+            "https://www.youtube.com/watch",
+            body=load_asset("youtube_consent_page_invalid.html.static"),
         )
 
         with self.assertRaises(FailedToCreateConsentCookie):
-            YouTubeTranscriptApi.get_transcript('F1xioXWb8CY')
+            YouTubeTranscriptApi().fetch("F1xioXWb8CY")
 
-    def test_get_transcript__exception_if_video_unavailable(self):
-        httpretty.register_uri(
-            httpretty.GET,
-            'https://www.youtube.com/watch',
-            body=load_asset('youtube_video_unavailable.html.static')
+    def test_fetch__exception_if_video_unavailable(self):
+        responses.replace(
+            responses.POST,
+            "https://www.youtube.com/youtubei/v1/player",
+            body=load_asset("youtube_video_unavailable.innertube.json.static"),
         )
 
         with self.assertRaises(VideoUnavailable):
-            YouTubeTranscriptApi.get_transcript('abc')
+            YouTubeTranscriptApi().fetch("abc")
 
-    def test_get_transcript__exception_if_youtube_request_fails(self):
-        httpretty.register_uri(
-            httpretty.GET,
-            'https://www.youtube.com/watch',
-            status=500
+    def test_fetch__exception_if_youtube_request_fails(self):
+        responses.replace(
+            responses.POST, "https://www.youtube.com/youtubei/v1/player", status=500
         )
 
-        with self.assertRaises(YouTubeRequestFailed):
-            YouTubeTranscriptApi.get_transcript('abc')
+        with self.assertRaises(YouTubeRequestFailed) as cm:
+            YouTubeTranscriptApi().fetch("abc")
 
-    def test_get_transcript__exception_if_youtube_request_limit_reached(self):
-        httpretty.register_uri(
-            httpretty.GET,
-            'https://www.youtube.com/watch',
-            body=load_asset('youtube_too_many_requests.html.static')
+        self.assertIn("Request to YouTube failed: ", str(cm.exception))
+
+    def test_fetch__exception_if_youtube_request_limit_reached(
+        self,
+    ):
+        responses.replace(
+            responses.GET,
+            "https://www.youtube.com/watch",
+            body=load_asset("youtube_too_many_requests.html.static"),
         )
 
-        with self.assertRaises(TooManyRequests):
-            YouTubeTranscriptApi.get_transcript('abc')
+        with self.assertRaises(IpBlocked):
+            YouTubeTranscriptApi().fetch("abc")
 
-    def test_get_transcript__exception_if_transcripts_disabled(self):
-        httpretty.register_uri(
-            httpretty.GET,
-            'https://www.youtube.com/watch',
-            body=load_asset('youtube_transcripts_disabled.html.static')
+    def test_fetch__exception_if_timedtext_request_limit_reached(
+        self,
+    ):
+        responses.replace(
+            responses.GET,
+            "https://www.youtube.com/api/timedtext",
+            status=429,
+        )
+
+        with self.assertRaises(IpBlocked):
+            YouTubeTranscriptApi().fetch("abc")
+
+    def test_fetch__exception_if_age_restricted(self):
+        responses.replace(
+            responses.POST,
+            "https://www.youtube.com/youtubei/v1/player",
+            body=load_asset("youtube_age_restricted.innertube.json.static"),
+        )
+
+        with self.assertRaises(AgeRestricted):
+            YouTubeTranscriptApi().fetch("Njp5uhTorCo")
+
+    def test_fetch__exception_if_ip_blocked(self):
+        responses.replace(
+            responses.GET,
+            "https://www.youtube.com/watch",
+            body=load_asset("youtube_too_many_requests.html.static"),
+        )
+
+        with self.assertRaises(IpBlocked):
+            YouTubeTranscriptApi().fetch("abc")
+
+    def test_fetch__exception_if_po_token_required(self):
+        responses.replace(
+            responses.POST,
+            "https://www.youtube.com/youtubei/v1/player",
+            body=load_asset("youtube_po_token_required.innertube.json.static"),
+        )
+
+        with self.assertRaises(PoTokenRequired):
+            YouTubeTranscriptApi().fetch("GJLlxj_dtq8")
+
+    def test_fetch__exception_request_blocked(self):
+        responses.replace(
+            responses.POST,
+            "https://www.youtube.com/youtubei/v1/player",
+            body=load_asset("youtube_request_blocked.innertube.json.static"),
+            content_type="application/json",
+        )
+
+        with self.assertRaises(RequestBlocked) as cm:
+            YouTubeTranscriptApi().fetch("Njp5uhTorCo")
+
+        self.assertIn("YouTube is blocking requests from your IP", str(cm.exception))
+
+    def test_fetch__exception_unplayable(self):
+        responses.replace(
+            responses.POST,
+            "https://www.youtube.com/youtubei/v1/player",
+            body=load_asset("youtube_unplayable.innertube.json.static"),
+        )
+
+        with self.assertRaises(VideoUnplayable) as cm:
+            YouTubeTranscriptApi().fetch("Njp5uhTorCo")
+        exception = cm.exception
+        self.assertEqual(exception.reason, "Custom Reason")
+        self.assertEqual(exception.sub_reasons, ["Sub Reason 1", "Sub Reason 2"])
+        self.assertIn("Custom Reason", str(exception))
+
+    def test_fetch__exception_if_transcripts_disabled(self):
+        responses.replace(
+            responses.POST,
+            "https://www.youtube.com/youtubei/v1/player",
+            body=load_asset("youtube_transcripts_disabled.innertube.json.static"),
         )
 
         with self.assertRaises(TranscriptsDisabled):
-            YouTubeTranscriptApi.get_transcript('dsMFmonKDD4')
+            YouTubeTranscriptApi().fetch("dsMFmonKDD4")
 
-        httpretty.register_uri(
-            httpretty.GET,
-            'https://www.youtube.com/watch',
-            body=load_asset('youtube_transcripts_disabled2.html.static')
+        responses.replace(
+            responses.POST,
+            "https://www.youtube.com/youtubei/v1/player",
+            body=load_asset("youtube_transcripts_disabled2.innertube.json.static"),
         )
         with self.assertRaises(TranscriptsDisabled):
-            YouTubeTranscriptApi.get_transcript('Fjg5lYqvzUs')
+            YouTubeTranscriptApi().fetch("Fjg5lYqvzUs")
 
-    def test_get_transcript__exception_if_language_unavailable(self):
-        with self.assertRaises(NoTranscriptFound):
-            YouTubeTranscriptApi.get_transcript('GJLlxj_dtq8', languages=['cz'])
+    def test_fetch__exception_if_language_unavailable(self):
+        with self.assertRaises(NoTranscriptFound) as cm:
+            YouTubeTranscriptApi().fetch("GJLlxj_dtq8", languages=["cz"])
 
-    def test_get_transcript__exception_if_no_transcript_available(self):
-        httpretty.register_uri(
-            httpretty.GET,
-            'https://www.youtube.com/watch',
-            body=load_asset('youtube_no_transcript_available.html.static')
+        self.assertIn("No transcripts were found for", str(cm.exception))
+
+    @patch("youtube_transcript_api.proxies.GenericProxyConfig.to_requests_dict")
+    def test_fetch__with_proxy(self, to_requests_dict):
+        proxy_config = GenericProxyConfig(
+            http_url="http://localhost:8080",
+            https_url="http://localhost:8080",
         )
-
-        with self.assertRaises(NoTranscriptAvailable):
-            YouTubeTranscriptApi.get_transcript('MwBPvcYFY2E')
-
-    def test_get_transcript__with_proxy(self):
-        proxies = {'http': '', 'https:': ''}
-        transcript = YouTubeTranscriptApi.get_transcript(
-            'GJLlxj_dtq8', proxies=proxies
+        transcript = YouTubeTranscriptApi(proxy_config=proxy_config).fetch(
+            "GJLlxj_dtq8"
         )
         self.assertEqual(
             transcript,
-            [
-                {'text': 'Hey, this is just a test', 'start': 0.0, 'duration': 1.54},
-                {'text': 'this is not the original transcript', 'start': 1.54, 'duration': 4.16},
-                {'text': 'just something shorter, I made up for testing', 'start': 5.7, 'duration': 3.239}
-            ]
+            self.ref_transcript,
         )
-    
-    def test_get_transcript__with_cookies(self):
-        dirname, filename = os.path.split(os.path.abspath(__file__))
-        cookies = dirname + '/example_cookies.txt'
-        transcript = YouTubeTranscriptApi.get_transcript('GJLlxj_dtq8', cookies=cookies)
+        to_requests_dict.assert_any_call()
+
+    @patch("youtube_transcript_api.proxies.GenericProxyConfig.to_requests_dict")
+    def test_fetch__with_proxy_prevent_alive_connections(self, to_requests_dict):
+        proxy_config = WebshareProxyConfig(
+            proxy_username="username", proxy_password="password"
+        )
+
+        YouTubeTranscriptApi(proxy_config=proxy_config).fetch("GJLlxj_dtq8")
+
+        request = responses.calls[-1].request
+        self.assertEqual(request.headers.get("Connection"), "close")
+
+    @patch("youtube_transcript_api.proxies.GenericProxyConfig.to_requests_dict")
+    def test_fetch__with_proxy_retry_when_blocked(self, to_requests_dict):
+        responses.replace(
+            responses.POST,
+            "https://www.youtube.com/youtubei/v1/player",
+            body=load_asset("youtube_request_blocked.innertube.json.static"),
+            content_type="application/json",
+        )
+        for _ in range(2):
+            responses.add(
+                responses.POST,
+                "https://www.youtube.com/youtubei/v1/player",
+                body=load_asset("youtube_request_blocked.innertube.json.static"),
+                content_type="application/json",
+            )
+        responses.add(
+            responses.POST,
+            "https://www.youtube.com/youtubei/v1/player",
+            body=load_asset("youtube.innertube.json.static"),
+            content_type="application/json",
+        )
+
+        proxy_config = WebshareProxyConfig(
+            proxy_username="username",
+            proxy_password="password",
+        )
+
+        YouTubeTranscriptApi(proxy_config=proxy_config).fetch("Njp5uhTorCo")
+
+        self.assertEqual(len(responses.calls), 2 * 3 + 3)
+
+    @patch("youtube_transcript_api.proxies.GenericProxyConfig.to_requests_dict")
+    def test_fetch__with_webshare_proxy_reraise_when_blocked(self, to_requests_dict):
+        retries = 5
+        responses.replace(
+            responses.POST,
+            "https://www.youtube.com/youtubei/v1/player",
+            body=load_asset("youtube_request_blocked.innertube.json.static"),
+            content_type="application/json",
+        )
+        for _ in range(retries - 1):
+            responses.add(
+                responses.POST,
+                "https://www.youtube.com/youtubei/v1/player",
+                body=load_asset("youtube_request_blocked.innertube.json.static"),
+                content_type="application/json",
+            )
+
+        proxy_config = WebshareProxyConfig(
+            proxy_username="username",
+            proxy_password="password",
+            retries_when_blocked=retries,
+        )
+
+        with self.assertRaises(RequestBlocked) as cm:
+            YouTubeTranscriptApi(proxy_config=proxy_config).fetch("Njp5uhTorCo")
+
+        self.assertEqual(len(responses.calls), retries * 2)
+        self.assertEqual(cm.exception._proxy_config, proxy_config)
+        self.assertIn("Webshare", str(cm.exception))
+
+    @patch("youtube_transcript_api.proxies.GenericProxyConfig.to_requests_dict")
+    def test_fetch__with_generic_proxy_reraise_when_blocked(self, to_requests_dict):
+        responses.replace(
+            responses.POST,
+            "https://www.youtube.com/youtubei/v1/player",
+            body=load_asset("youtube_request_blocked.innertube.json.static"),
+            content_type="application/json",
+        )
+
+        proxy_config = GenericProxyConfig(
+            http_url="http://localhost:8080",
+            https_url="http://localhost:8080",
+        )
+
+        with self.assertRaises(RequestBlocked) as cm:
+            YouTubeTranscriptApi(proxy_config=proxy_config).fetch("Njp5uhTorCo")
+
+        self.assertEqual(len(responses.calls), 2)
+        self.assertEqual(cm.exception._proxy_config, proxy_config)
+        self.assertIn("YouTube is blocking your requests", str(cm.exception))
+
+    @pytest.mark.skip(
+        reason="This test is temporarily disabled because cookie auth is currently not "
+        "working due to YouTube changes."
+    )
+    def test_fetch__with_cookies(self):
+        cookie_path = get_asset_path("example_cookies.txt")
+        transcript = YouTubeTranscriptApi(cookie_path=cookie_path).fetch("GJLlxj_dtq8")
 
         self.assertEqual(
             transcript,
-            [
-                {'text': 'Hey, this is just a test', 'start': 0.0, 'duration': 1.54},
-                {'text': 'this is not the original transcript', 'start': 1.54, 'duration': 4.16},
-                {'text': 'just something shorter, I made up for testing', 'start': 5.7, 'duration': 3.239}
-            ]
+            self.ref_transcript,
         )
 
-    def test_get_transcript__assertionerror_if_input_not_string(self):
-        with self.assertRaises(AssertionError):
-            YouTubeTranscriptApi.get_transcript(['video_id_1', 'video_id_2'])
-
-    def test_get_transcripts__assertionerror_if_input_not_list(self):
-        with self.assertRaises(AssertionError):
-            YouTubeTranscriptApi.get_transcripts('video_id_1')
-
-    @patch('youtube_transcript_api.YouTubeTranscriptApi.get_transcript')
-    def test_get_transcripts(self, mock_get_transcript):
-        video_id_1 = 'video_id_1'
-        video_id_2 = 'video_id_2'
-        languages = ['de', 'en']
-
-        YouTubeTranscriptApi.get_transcripts([video_id_1, video_id_2], languages=languages)
-
-        mock_get_transcript.assert_any_call(video_id_1, languages, None, None, False)
-        mock_get_transcript.assert_any_call(video_id_2, languages, None, None, False)
-        self.assertEqual(mock_get_transcript.call_count, 2)
-
-    @patch('youtube_transcript_api.YouTubeTranscriptApi.get_transcript', side_effect=Exception('Error'))
-    def test_get_transcripts__stop_on_error(self, mock_get_transcript):
-        with self.assertRaises(Exception):
-            YouTubeTranscriptApi.get_transcripts(['video_id_1', 'video_id_2'])
-
-    @patch('youtube_transcript_api.YouTubeTranscriptApi.get_transcript', side_effect=Exception('Error'))
-    def test_get_transcripts__continue_on_error(self, mock_get_transcript):
-        video_id_1 = 'video_id_1'
-        video_id_2 = 'video_id_2'
-
-        YouTubeTranscriptApi.get_transcripts(['video_id_1', 'video_id_2'], continue_after_error=True)
-
-        mock_get_transcript.assert_any_call(video_id_1, ('en',), None, None, False)
-        mock_get_transcript.assert_any_call(video_id_2, ('en',), None, None, False)
-    
-    @patch('youtube_transcript_api.YouTubeTranscriptApi.get_transcript')
-    def test_get_transcripts__with_cookies(self, mock_get_transcript):
-        cookies = '/example_cookies.txt'
-        YouTubeTranscriptApi.get_transcripts(['GJLlxj_dtq8'], cookies=cookies)
-        mock_get_transcript.assert_any_call('GJLlxj_dtq8', ('en',), None, cookies, False)
-
-    @patch('youtube_transcript_api.YouTubeTranscriptApi.get_transcript')
-    def test_get_transcripts__with_proxies(self, mock_get_transcript):
-        proxies = {'http': '', 'https:': ''}
-        YouTubeTranscriptApi.get_transcripts(['GJLlxj_dtq8'], proxies=proxies)
-        mock_get_transcript.assert_any_call('GJLlxj_dtq8', ('en',), proxies, None, False)
-
+    @pytest.mark.skip(
+        reason="This test is temporarily disabled because cookie auth is currently not "
+        "working due to YouTube changes."
+    )
     def test_load_cookies(self):
-        dirname, filename = os.path.split(os.path.abspath(__file__))
-        cookies = dirname + '/example_cookies.txt'
-        session_cookies = YouTubeTranscriptApi._load_cookies(cookies, 'GJLlxj_dtq8')
-        self.assertEqual({'TEST_FIELD': 'TEST_VALUE'},  requests.utils.dict_from_cookiejar(session_cookies))
+        cookie_path = get_asset_path("example_cookies.txt")
 
+        ytt_api = YouTubeTranscriptApi(cookie_path=cookie_path)
+
+        session_cookies = ytt_api._fetcher._http_client.cookies
+        self.assertEqual(
+            {"TEST_FIELD": "TEST_VALUE"},
+            requests.utils.dict_from_cookiejar(session_cookies),
+        )
+
+    @pytest.mark.skip(
+        reason="This test is temporarily disabled because cookie auth is currently not "
+        "working due to YouTube changes."
+    )
     def test_load_cookies__bad_file_path(self):
-        bad_cookies = 'nonexistent_cookies.txt'
+        cookie_path = get_asset_path("nonexistent_cookies.txt")
         with self.assertRaises(CookiePathInvalid):
-            YouTubeTranscriptApi._load_cookies(bad_cookies, 'GJLlxj_dtq8')
+            YouTubeTranscriptApi(cookie_path=cookie_path)
 
+    @pytest.mark.skip(
+        reason="This test is temporarily disabled because cookie auth is currently not "
+        "working due to YouTube changes."
+    )
     def test_load_cookies__no_valid_cookies(self):
-        dirname, filename = os.path.split(os.path.abspath(__file__))
-        expired_cookies = dirname + '/expired_example_cookies.txt'
-        with self.assertRaises(CookiesInvalid):
-            YouTubeTranscriptApi._load_cookies(expired_cookies, 'GJLlxj_dtq8')
+        cookie_path = get_asset_path("expired_example_cookies.txt")
+        with self.assertRaises(CookieInvalid):
+            YouTubeTranscriptApi(cookie_path=cookie_path)
